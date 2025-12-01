@@ -1,0 +1,21 @@
+##### create virtual environment is rds (Research Data Store)
+# Just SSH into CSD3 and run from the login node:
+
+cd ~/rds/hpc-work
+module purge
+module load rhel8/default-amp
+module load python/3.8.11/gcc-9.4.0-yb6rzr6
+
+python -m venv ./pytorch-ampere-env
+source ./pytorch-ampere-env/bin/activate
+
+# Install all packages
+pip install "torch" "transformers" "accelerate" "evaluate" "tqdm" "numpy"
+
+
+
+
+
+##### interactive GPU node
+
+sintr -t 00:10:00 --exclusive -A SAMWORTH-SL3-GPU -p ampere
