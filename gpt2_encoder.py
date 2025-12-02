@@ -17,31 +17,32 @@ from random_besov import FastWaveletBatchGenerator
 
 
 ###### Generate pretraining data for in-context regression transformer model
-def generate_pretrain_data(X_list, params_list, d_embd, sigma, device='cuda'):
+
+def generate_pretrain_data(X_list, params, d_embd, sigma):
     """
     Generates function data and prepares it for an in-context regression transformer model.
 
     Args:
         X_list (list of np.ndarray): List of input point arrays. Each array
-            can have a different number of points (N), but must have the
-            same dimension (d).
-        params_list (list of dicts): A list where each dict contains the
-            parameters for one function: {'d', 'alpha', 'J', 'seed', 'C0'}.
+            can have N points and dimension d.
+        params (dict): A dictionary that contains the
+            parameters for the functions: {'d', 'alpha', 'J', 'C0'}.
         d_embd (int): The embedding dimension for the transformer input.
         sigma (float): The standard deviation of Gaussian noise to add to the Y values.
-        device (str or torch.device): The Torch device for the output tensors.
 
     Returns:
         tuple[torch.Tensor, torch.Tensor]:
-        - A tensor of shape (batch_size, max_N, d_embd) containing the
+        - A tensor of shape (batch_size, N, d_embd) containing the
           concatenated and padded X and Y sequences. The last Y value
           in each sequence is masked with 0.
         - A tensor of shape (batch_size,) containing the true last Y value
           for each sequence, which serves as the regression target.
     """
     generator = FastWaveletBatchGenerator(wavelet='db6', cascade_level=8)
-    Y_list = generator.generate_batch_torch(X_list, params_list, device=device)
+    Y_list = generator.generate_batch(X_list, params)
     generator.cleanup()
+
+    device = torch.device('cuda')
 
     # Ensure d is correctly inferred even for 1D inputs
     if X_list[0].ndim == 1:
@@ -53,42 +54,41 @@ def generate_pretrain_data(X_list, params_list, d_embd, sigma, device='cuda'):
         raise ValueError(f"d_embd ({d_embd}) must be greater than or equal to the input dimension + 3 ({d + 3}).")
 
     batch_size = len(X_list)
-    max_N = max(x.shape[0] for x in X_list) if batch_size > 0 else 0
+    N = X_list[0].shape[0] 
 
     # Initialize output tensors
-    output_sequences = torch.zeros((batch_size, max_N, d_embd), dtype=torch.float32, device=device)
+    output_sequences = torch.zeros((batch_size, N, d_embd), dtype=torch.float32, device=device)
     target_values = torch.zeros(batch_size, dtype=torch.float32, device=device)
 
     for i in range(batch_size):
         # Get original data
-        X_i_np = X_list[i]
-        Y_i_torch = Y_list[i]
+        X_i = X_list[i]
+        Y_i = Y_list[i]
         
         # Add noise
         if sigma > 0:
-            Y_i_torch += torch.randn_like(Y_i_torch) * sigma
+            Y_i += np.random.normal(scale=sigma, size=Y_i.shape)
 
         # Get the target value (the last Y value)
-        target_values[i] = Y_i_torch[-1]
+        target_values[i] = torch.as_tensor(Y_i[-1], device=device)
         
         # Prepare the input sequence
         # Convert X to a tensor
-        X_i_torch = torch.from_numpy(np.asarray(X_i_np, dtype=np.float32)).to(device)
+        X_i_torch = torch.from_numpy(np.asarray(X_i, dtype=np.float32)).to(device)
         if X_i_torch.ndim == 1:
             X_i_torch = X_i_torch.unsqueeze(-1)
         
         # Mask the last Y value
-        Y_masked = Y_i_torch.clone()
-        Y_masked[-1] = 0.0
+        Y_i[-1] = 0
+        Y_i_torch = torch.from_numpy(np.asarray(Y_i, dtype=np.float32)).to(device)
 
         # Concatenate X and Y_masked
         # Y_masked needs to be shaped as (N, 1)
-        xy_concat = torch.cat((X_i_torch, Y_masked.unsqueeze(-1)), dim=1)
+        xy_concat = torch.cat((X_i_torch, Y_i_torch.unsqueeze(-1)), dim=1)
         
         # Place the concatenated sequence into the padded output tensor
-        current_N = xy_concat.shape[0]
-        output_sequences[i, :current_N, :(d + 1)] = xy_concat
-        output_sequences[i, current_N - 1, d + 1] = 1
+        output_sequences[i, :N, :(d + 1)] = xy_concat
+        output_sequences[i, N - 1, d + 1] = 1
 
     return output_sequences, target_values
 
@@ -97,7 +97,7 @@ def generate_pretrain_data(X_list, params_list, d_embd, sigma, device='cuda'):
 ###### Transformer Model Definition
 class ModelConfig:
     """Holds model hyperparameters."""
-    def __init__(self, d_embd=768, d_ffn=3072, n_layer=12, n_head=12, max_length=None):
+    def __init__(self, d_embd=1024, d_ffn=4096, n_layer=24, n_head=16, max_length=None):
         self.d_embd = d_embd
         self.d_ffn = d_ffn
         self.n_layer = n_layer
@@ -187,30 +187,4 @@ class RegressionTransformer(nn.Module):
         # Return the last coordinate of the last token
         return x[:, -1, -1]
 
-if __name__ == '__main__':
-    # --- Example Usage ---
-    
-    # 1. Define model configuration
-    # d_embd is the dimensionality of the input vectors
-    config = ModelConfig(
-        d_embd=64,
-        d_ffn=256,
-        n_layer=4, 
-        n_head=4
-    )
 
-    # 2. Instantiate the model
-    model = RegressionTransformer(config)
-    print(f"Model created with {sum(p.numel() for p in model.parameters())/1e6:.2f}M parameters.")
-
-    # 3. Create a dummy input tensor of vectors
-    # batch_size = 2, sequence_length = 32, feature_dim = d_embd = 64
-    dummy_input = torch.randn(2, 32, config.d_embd)
-
-    # 4. Forward pass
-    output = model(dummy_input)
-
-    # 5. Print output shape
-    print("Input shape:", dummy_input.shape)
-    print("Output shape:", output.shape)
-    # Expected output shape: (batch_size,) -> (2,)

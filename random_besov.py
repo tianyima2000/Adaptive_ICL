@@ -74,15 +74,7 @@ def _get_library_path():
     return lib_path
 
 
-# Define the ctypes Structure to match the C-side struct
-class WaveletParams(ctypes.Structure):
-    _fields_ = [
-        ("alpha", ctypes.c_float),
-        ("J", ctypes.c_int),
-        ("C0", ctypes.c_float),
-        ("seed", ctypes.c_uint32),
-        ("d", ctypes.c_int),
-    ]
+
 
 class FastWaveletBatchGenerator:
     """
@@ -170,13 +162,14 @@ class FastWaveletBatchGenerator:
             ctypes.POINTER(ctypes.c_int),    # h_offsets
             ctypes.c_int,                    # total_points
             ctypes.c_int,                    # d
-            ctypes.POINTER(WaveletParams),   # h_params
+            ctypes.c_float,                  # alpha
+            ctypes.c_int,                    # J
+            ctypes.c_float,                  # C0
             ctypes.c_int,                    # batch_size
             ctypes.POINTER(ctypes.c_float),  # h_phi
             ctypes.POINTER(ctypes.c_float),  # h_psi
             ctypes.POINTER(ctypes.c_float),  # h_grid
             ctypes.c_int,                    # grid_len
-            ctypes.c_int,                    # max_J
             ctypes.c_int,                    # max_N
         ]
         self.lib.generate_wavelet_batch.restype = ctypes.c_int
@@ -197,29 +190,30 @@ class FastWaveletBatchGenerator:
         """Ensures cleanup is called when the object is garbage collected."""
         self.cleanup()
 
-    def generate_batch(self, X_list, params_list):
+    def generate_batch(self, X_list, params):
         """
         Generates a batch of random functions, each on its own input grid.
         
         Args:
             X_list (list of np.ndarray): A list of input points arrays. Each array
                 can have a different number of points (N), but must have the
-                same dimension (d). E.g., [X1, X2] where X1.shape=(N1, d) and X2.shape=(N2, d).
-            params_list (list of dicts): A list where each dict contains the
-                parameters for one function: {'d', 'alpha', 'J', 'seed', 'C0'}.
-                The dimension 'd' must be the same for all functions in the batch.
+                same dimension (d) as specified in params. E.g., [X1, X2] 
+                where X1.shape=(N1, d) and X2.shape=(N2, d).
+            params (dict): A dictionary containing the shared parameters for the
+                entire batch: {'d', 'alpha', 'J', 'C0'}. The 'seed' parameter
+                is no longer used and is ignored.
         """
         if not self.lib:
             raise RuntimeError("The CUDA library has been unloaded. Please create a new generator instance.")
-        if not params_list:
+        if not X_list:
             return []
-        if len(X_list) != len(params_list):
-            raise ValueError(f"Length of X_list ({len(X_list)}) must match length of params_list ({len(params_list)}).")
             
-        # Validate all params have the same 'd'
-        d = params_list[0]['d']
-        if any(p['d'] != d for p in params_list):
-            raise ValueError("All functions in a batch must have the same dimension 'd'.")
+        # Extract shared parameters from the params dictionary.
+        d = params['d']
+        J = params['J']
+        alpha = params.get('alpha', 1.0)
+        C0 = params.get('C0', 1.0)
+
         if d < 1 or d > 4:
             raise ValueError(f"d must be between 1 and 4 (MAX_DIM in CUDA), got {d}")
         
@@ -232,7 +226,7 @@ class FastWaveletBatchGenerator:
                 raise ValueError(f"X at index {i} must have shape (N, {d}), got {X_arr.shape}")
             processed_X_list.append(X_arr)
 
-        batch_size = len(params_list)
+        batch_size = len(X_list)
         N_values = np.array([x.shape[0] for x in processed_X_list], dtype=np.int32)
         total_points = np.sum(N_values)
         max_N = np.max(N_values) if N_values.size > 0 else 0
@@ -240,19 +234,8 @@ class FastWaveletBatchGenerator:
         # Offsets are the cumulative sum of points, starting with 0
         offsets = np.concatenate(([0], np.cumsum(N_values[:-1]))).astype(np.int32)
 
-        X_concat = np.vstack(processed_X_list)
-        
-        max_J = max(p['J'] for p in params_list)
-        
-        # Create ctypes array of a custom struct for parameters
-        ParamsArray = WaveletParams * batch_size
-        h_params = ParamsArray()
-        for i, p in enumerate(params_list):
-            h_params[i] = WaveletParams(
-                alpha=p.get('alpha', 1.0), J=p['J'], C0=p.get('C0', 1.0),
-                seed=p['seed'], d=p['d']
-            )
-            
+        X_concat = np.vstack(processed_X_list) if processed_X_list else np.array([], dtype=np.float32).reshape(0, d)
+                    
         # Prepare output array
         Y_concat = np.ascontiguousarray(np.zeros(total_points, dtype=np.float32))
         
@@ -264,13 +247,14 @@ class FastWaveletBatchGenerator:
             offsets.ctypes.data_as(ctypes.POINTER(ctypes.c_int)),
             total_points,
             d,
-            h_params,
+            alpha,
+            J,
+            C0,
             batch_size,
             self.phi.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
             self.psi.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
             self.grid.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
             len(self.grid),
-            max_J,
             max_N
         )
 
@@ -283,104 +267,8 @@ class FastWaveletBatchGenerator:
             )
         
         # Split the concatenated output back into a list of arrays
-        # Note: np.split works correctly even if offsets[1:] is empty (for batch_size=1)
-        return np.split(Y_concat, offsets[1:])
-
-    def generate_batch_torch(self, X_list, params_list, device='cuda'):
-        """
-        Generates a batch of random functions directly on a target device.
-
-        Args:
-            X_list (list of np.ndarray): List of input point arrays.
-            params_list (list of dicts): List of function parameters.
-            device (str or torch.device): The Torch device for the output ('cuda', 'cpu', etc.).
-
-        Returns:
-            list of torch.Tensor: A list of 1D tensors, each containing a generated
-                                  function. The tensors reside on the specified device.
-        """
-        if not self.lib:
-            raise RuntimeError("The CUDA library has been unloaded. Please create a new generator instance.")
-        if not params_list:
-            return []
-        if len(X_list) != len(params_list):
-            raise ValueError(f"Length of X_list ({len(X_list)}) must match length of params_list ({len(params_list)}).")
-
-        # Validate all params have the same 'd'
-        d = params_list[0]['d']
-        if any(p['d'] != d for p in params_list):
-            raise ValueError("All functions in a batch must have the same dimension 'd'.")
-        if d < 1 or d > 4:
-            raise ValueError(f"d must be between 1 and 4 (MAX_DIM in CUDA), got {d}")
-
-        # Prepare data for concatenated input (still on CPU)
-        processed_X_list = []
-        for i, X in enumerate(X_list):
-            X_arr = np.ascontiguousarray(np.asarray(X, dtype=np.float32))
-            if X_arr.ndim == 1: X_arr = X_arr.reshape(-1, d)
-            if X_arr.shape[1] != d:
-                raise ValueError(f"X at index {i} must have shape (N, {d}), got {X_arr.shape}")
-            processed_X_list.append(X_arr)
-
-        batch_size = len(params_list)
-        N_values = np.array([x.shape[0] for x in processed_X_list], dtype=np.int32)
-        total_points = np.sum(N_values)
-        max_N = np.max(N_values) if N_values.size > 0 else 0
-        
-        offsets = np.concatenate(([0], np.cumsum(N_values[:-1]))).astype(np.int32)
-
-        X_concat = np.vstack(processed_X_list)
-        
-        max_J = max(p['J'] for p in params_list)
-        
-        # Create ctypes array of a custom struct for parameters
-        ParamsArray = WaveletParams * batch_size
-        h_params = ParamsArray()
-        for i, p in enumerate(params_list):
-            h_params[i] = WaveletParams(
-                alpha=p.get('alpha', 1.0), J=p['J'], C0=p.get('C0', 1.0),
-                seed=p['seed'], d=p['d']
-            )
-            
-        # Prepare output tensor directly on the target device
-        # Using .empty() is efficient as the CUDA kernel will overwrite the memory.
-        Y_torch = torch.empty(total_points, dtype=torch.float32, device=device)
-        
-        # Get data pointer. For CUDA tensors, this is a GPU memory address.
-        # The CUDA kernel must be able to handle receiving a device pointer for the output.
-        Y_ptr = ctypes.cast(Y_torch.data_ptr(), ctypes.POINTER(ctypes.c_float))
-        
-        # Call the CUDA function
-        ret_code = self.lib.generate_wavelet_batch(
-            X_concat.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
-            Y_ptr,
-            N_values.ctypes.data_as(ctypes.POINTER(ctypes.c_int)),
-            offsets.ctypes.data_as(ctypes.POINTER(ctypes.c_int)),
-            total_points,
-            d,
-            h_params,
-            batch_size,
-            self.phi.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
-            self.psi.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
-            self.grid.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
-            len(self.grid),
-            max_J,
-            max_N
-        )
-
-        # Check the return code from the C++ function
-        if ret_code != 0:
-            raise RuntimeError(
-                f"The CUDA function 'generate_wavelet_batch' failed with error code {ret_code}. "
-                "This is likely due to a CUDA error, such as running out of GPU memory. "
-                "Check the console output of your Jupyter notebook server for a more detailed 'CUDA Error' message."
-            )
-        
-        # Split the concatenated output tensor back into a list of tensors.
-        # N_values contains the size of each chunk.
         if total_points > 0:
-            return list(torch.split(Y_torch, N_values.tolist()))
+            return np.split(Y_concat, offsets[1:])
         else:
             return []
-
 

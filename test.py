@@ -39,22 +39,14 @@ def sample_projected_vectors(d, p, n):
 import time
 
 start = time.time()
-params_list = []
+params = {'d': 1, 'alpha': 1, 'J': 10, 'C0': 1.0}
 X_list = []
-num_functions = 100
+num_functions = 1000
 for i in range(num_functions):
-    params_list.append({
-        'd': 1,
-        'alpha': 1,
-        'J': 10,
-        'seed': np.random.randint(0, 2**30),
-        'C0': 1.0
-    })
-
     X_list.append(sample_projected_vectors(10, 1, 100)) 
 
 random_besov_generator = FastWaveletBatchGenerator(wavelet='db6', cascade_level=8)
-Y_list = random_besov_generator.generate_batch(X_list, params_list)
+Y_list = random_besov_generator.generate_batch(X_list, params)
 random_besov_generator.cleanup()
 
 end = time.time()

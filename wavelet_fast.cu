@@ -3,6 +3,7 @@
 #include <stdio.h>
 #include <math.h>
 #include <stdint.h>
+#include <time.h>
 
 // Helper macro for checking CUDA calls (expects `status` variable and `cleanup` label in scope)
 #define CUDA_CHECK(call)                                                                 \
@@ -54,97 +55,137 @@ __constant__ float d_support_max;
 __constant__ int d_grid_len;
 __constant__ int d_K_side;
 
-// Per-function parameters
-typedef struct {
-    float alpha;
-    int J;
-    float C0;
-    uint32_t seed;
-    int d; // Dimension
-} WaveletParams;
+// Shared wavelet parameters (constant across the batch)
+__constant__ float d_alpha;
+__constant__ int d_J;
+__constant__ float d_C0;
+__constant__ int d_d;
 
-// --- Fused Kernel for Metadata + Scaling ---
-__global__ void compute_metadata_and_scale_kernel(
-    WaveletParams* params,
+// Per-function seeds are now generated on-the-fly inside the host function.
+
+// --- Kernel to compute metadata ONCE for the whole batch ---
+__global__ void compute_shared_metadata_kernel(
+    int max_total_configs,
+    int* __restrict__ all_coeff_offsets,
+    int* __restrict__ all_k_ranges,
+    int* __restrict__ total_coeffs_per_func)
+{
+    // This kernel is launched with a single block. It calculates the metadata
+    // for func_idx = 0. This metadata is then broadcast to all other functions.
+    if (threadIdx.x == 0) {
+        int d = d_d;
+        int J = d_J;
+        int K_side = d_K_side;
+        int max_masks = 1 << d;
+
+        int* h_offsets = &all_coeff_offsets[0]; // Writing to the first slot
+        int* h_k_ranges = &all_k_ranges[0];     // Writing to the first slot
+
+        int total = 0;
+        for (int j = 0; j <= J; j++) {
+            int translations = 1 << j;
+            int count_per_mask = 1;
+            for (int i = 0; i < d; i++) {
+                int k_min = -K_side;
+                int k_max = (translations - 1) + K_side;
+                h_k_ranges[j * d * 2 + i * 2] = k_min;
+                h_k_ranges[j * d * 2 + i * 2 + 1] = k_max;
+                count_per_mask *= (k_max - k_min + 1);
+            }
+            
+            int start_mask = (j == 0) ? 0 : 1;
+            int end_mask = (j == 0) ? 1 : max_masks;
+            for (int mask = start_mask; mask < end_mask; mask++) {
+                h_offsets[j * max_masks + mask] = total;
+                total += count_per_mask;
+            }
+        }
+        total_coeffs_per_func[0] = total; // Writing to the first slot
+    }
+}
+
+// --- Kernel to broadcast the shared metadata from function 0 to all others ---
+__global__ void broadcast_metadata_kernel(
+    int batch_size,
+    int max_total_configs,
+    int k_ranges_size,
+    int* __restrict__ all_coeff_offsets,
+    int* __restrict__ all_k_ranges,
+    int* __restrict__ total_coeffs_per_func)
+{
+    int func_idx = blockIdx.x + 1; // Start from function 1
+    if (func_idx >= batch_size) return;
+
+    // Source pointers (from function 0)
+    const int* src_offsets = &all_coeff_offsets[0];
+    const int* src_k_ranges = &all_k_ranges[0];
+    const int src_total_coeffs = total_coeffs_per_func[0];
+
+    // Destination pointers
+    int* dst_offsets = &all_coeff_offsets[func_idx * max_total_configs];
+    int* dst_k_ranges = &all_k_ranges[func_idx * k_ranges_size];
+
+    // Copy data in parallel
+    for (int i = threadIdx.x; i < max_total_configs; i += blockDim.x) {
+        dst_offsets[i] = src_offsets[i];
+    }
+    
+    for (int i = threadIdx.x; i < k_ranges_size; i += blockDim.x) {
+        dst_k_ranges[i] = src_k_ranges[i];
+    }
+
+    if (threadIdx.x == 0) {
+        total_coeffs_per_func[func_idx] = src_total_coeffs;
+    }
+}
+
+// --- Kernel to scale the random coefficients ---
+__global__ void scale_coefficients_kernel(
     int batch_size,
     int max_total_coeffs,
     int max_total_configs,
     float* __restrict__ all_coeffs,
-    int* __restrict__ all_coeff_offsets,
-    int* __restrict__ all_k_ranges,
-    int* __restrict__ total_coeffs_per_func,
-    int max_J,
-    bool compute_metadata,
-    bool scale_coefficients)
+    const int* __restrict__ all_coeff_offsets,
+    const int* __restrict__ all_k_ranges,
+    const int* __restrict__ total_coeffs_per_func)
 {
     int func_idx = blockIdx.x;
     if (func_idx >= batch_size) return;
 
-    WaveletParams p = params[func_idx];
-    int d = p.d;
-    int J = p.J;
-    int K_side = d_K_side;
+    // Shared parameters are now read from constant memory
+    int d = d_d;
+    int J = d_J;
     int max_masks = 1 << d;
 
-    int* h_offsets = &all_coeff_offsets[func_idx * max_total_configs];
-    int* h_k_ranges = &all_k_ranges[func_idx * (max_J + 1) * d * 2];
-
-    if (compute_metadata) {
-        if (threadIdx.x == 0) {
-            int total = 0;
-            for (int j = 0; j <= J; j++) {
-                int translations = 1 << j;
-                int count_per_mask = 1;
-                for (int i = 0; i < d; i++) {
-                    int k_min = -K_side;
-                    int k_max = (translations - 1) + K_side;
-                    h_k_ranges[j * d * 2 + i * 2] = k_min;
-                    h_k_ranges[j * d * 2 + i * 2 + 1] = k_max;
-                    count_per_mask *= (k_max - k_min + 1);
-                }
-                
-                int start_mask = (j == 0) ? 0 : 1;
-                int end_mask = (j == 0) ? 1 : max_masks;
-                for (int mask = start_mask; mask < end_mask; mask++) {
-                    h_offsets[j * max_masks + mask] = total;
-                    total += count_per_mask;
-                }
-            }
-            total_coeffs_per_func[func_idx] = total;
-        }
-    }
+    const int* h_offsets = &all_coeff_offsets[func_idx * max_total_configs];
+    const int* h_k_ranges = &all_k_ranges[func_idx * (J + 1) * d * 2];
     
-    // Synchronize to ensure metadata is visible to all threads before scaling
-    __syncthreads();
+    int total_coeffs = total_coeffs_per_func[func_idx];
+    float* h_coeffs = &all_coeffs[func_idx * max_total_coeffs];
 
-    if (scale_coefficients) {
-        int total_coeffs = total_coeffs_per_func[func_idx];
-        float* h_coeffs = &all_coeffs[func_idx * max_total_coeffs];
-
-        // Parallel scaling of coefficients
-        for (int j = 0; j <= J; j++) {
-            float scale = (j == 0) ? (p.C0 * powf(2.0f, -0.5f * d)) :
-                                     (p.C0 * powf(2.0f, -(p.alpha + d / 2.0f) * j));
-            
-            int count_per_mask = 1;
-            for (int i = 0; i < d; ++i) {
+    // Parallel scaling of coefficients
+    for (int j = 0; j <= J; j++) {
+        float scale = (j == 0) ? (d_C0 * powf(2.0f, -0.5f * d)) :
+                                     (d_C0 * powf(2.0f, -(d_alpha + d / 2.0f) * j));
+        
+        int count_per_mask = 1;
+        for (int i = 0; i < d; ++i) {
                  count_per_mask *= (h_k_ranges[j * d * 2 + i * 2 + 1] - h_k_ranges[j * d * 2 + i * 2] + 1);
-            }
+        }
 
-            int start_mask = (j == 0) ? 0 : 1;
-            int end_mask = (j == 0) ? 1 : max_masks;
-            for (int mask = start_mask; mask < end_mask; mask++) {
-                int offset = h_offsets[j * max_masks + mask];
-                
-                int idx = threadIdx.x;
-                while(idx < count_per_mask) {
-                    int an_idx = offset + idx;
-                    if(an_idx < total_coeffs) {
-                        // The random numbers are in (0, 1]. Transform to (-1, 1].
-                        h_coeffs[an_idx] = scale * (h_coeffs[an_idx] * 2.0f - 1.0f);
-                    }
-                    idx += blockDim.x;
+        int start_mask = (j == 0) ? 0 : 1;
+        int end_mask = (j == 0) ? 1 : max_masks;
+        for (int mask = start_mask; mask < end_mask; mask++) {
+            int offset = h_offsets[j * max_masks + mask];
+            
+            int idx = threadIdx.x;
+            while(idx < count_per_mask) {
+                int an_idx = offset + idx;
+                if(an_idx < total_coeffs) {
+                    // The random numbers are in (0, 1]. Transform to (-1, 1].
+                    h_coeffs[an_idx] = scale * (h_coeffs[an_idx] * 2.0f - 1.0f);
                 }
+                idx += blockDim.x;
             }
         }
     }
@@ -189,7 +230,6 @@ __device__ __forceinline__ bool advance_k_vector(int* k_vec, const int* k_min, c
 
 __global__ void evaluate_wavelet_batch_kernel(
     const float* __restrict__ X_concat,
-    const WaveletParams* __restrict__ params,
     const float* __restrict__ all_coeffs,
     const int* __restrict__ all_coeff_offsets,
     const int* __restrict__ all_k_ranges,
@@ -197,8 +237,7 @@ __global__ void evaluate_wavelet_batch_kernel(
     int max_total_configs,
     float* __restrict__ Y_concat,
     const int* __restrict__ N_values,
-    const int* __restrict__ offsets,
-    int max_J)
+    const int* __restrict__ offsets)
 {
     int func_idx = blockIdx.x;
     int n = threadIdx.x + blockIdx.y * blockDim.x;
@@ -206,9 +245,9 @@ __global__ void evaluate_wavelet_batch_kernel(
     int N_current_func = N_values[func_idx];
     if (n >= N_current_func) return;
 
-    WaveletParams p = params[func_idx];
-    int d = p.d;
-    int J = p.J;
+    // Shared parameters are now read from constant memory
+    int d = d_d;
+    int J = d_J;
     int max_masks = 1 << d;
 
     int x_offset = offsets[func_idx];
@@ -216,7 +255,7 @@ __global__ void evaluate_wavelet_batch_kernel(
 
     const float* coeffs = &all_coeffs[func_idx * max_total_coeffs];
     const int* coeff_offsets = &all_coeff_offsets[func_idx * max_total_configs];
-    const int* k_ranges = &all_k_ranges[func_idx * (max_J + 1) * d * 2];
+    const int* k_ranges = &all_k_ranges[func_idx * (J + 1) * d * 2];
     const float* x_vec_base = &X_concat[(x_offset + n) * d];
     float* y_out = &Y_concat[y_offset + n];
 
@@ -354,27 +393,32 @@ DLLEXPORT int generate_wavelet_batch(
     const int* h_offsets,
     int total_points,
     int d,
-    const WaveletParams* h_params,
+    float alpha,
+    int J,
+    float C0,
     int batch_size,
     const float* h_phi,
     const float* h_psi,
     const float* h_grid,
     int grid_len,
-    int max_J,
     int max_N)
 {
     int status = 0;
     float *d_X_concat = NULL, *d_Y_concat = NULL, *d_all_coeffs = NULL;
     int *d_all_coeff_offsets = NULL, *d_all_k_ranges = NULL, *d_total_coeffs_per_func = NULL;
     int *d_N_values = NULL, *d_offsets = NULL;
-    WaveletParams* d_params = NULL;
-    int* h_total_coeffs_per_func = NULL;
+    int h_total_coeffs;
     curandGenerator_t* gens = NULL;
     int gens_created = 0;
+    unsigned long long base_seed = time(NULL);
 
     // Validate dimension to avoid overrunning fixed-size stack buffers in kernels
     if (d < 1 || d > MAX_DIM) {
         fprintf(stderr, "Invalid dimension d=%d (MAX_DIM=%d)\n", d, MAX_DIM);
+        return -1;
+    }
+    if (grid_len < 1 || grid_len > MAX_GRID_SIZE) {
+        fprintf(stderr, "Invalid grid_len=%d (MAX_GRID_SIZE=%d)\n", grid_len, MAX_GRID_SIZE);
         return -1;
     }
 
@@ -395,8 +439,9 @@ DLLEXPORT int generate_wavelet_batch(
     int max_total_configs = 0;
     int max_total_coeffs = 0;
     dim3 grid_dim(1, 1);
+    int k_ranges_size = 0;
 
-    // 1. Copy wavelet data to constant memory
+    // 1. Copy wavelet and shared parameters to constant memory
     CUDA_CHECK(cudaMemcpyToSymbol(d_phi, h_phi, grid_len * sizeof(float)));
     CUDA_CHECK(cudaMemcpyToSymbol(d_psi, h_psi, grid_len * sizeof(float)));
     CUDA_CHECK(cudaMemcpyToSymbol(d_grid, h_grid, grid_len * sizeof(float)));
@@ -414,13 +459,19 @@ DLLEXPORT int generate_wavelet_batch(
     CUDA_CHECK(cudaMemcpyToSymbol(d_support_min, &support_min, sizeof(float)));
     CUDA_CHECK(cudaMemcpyToSymbol(d_support_max, &support_max, sizeof(float)));
 
+    CUDA_CHECK(cudaMemcpyToSymbol(d_alpha, &alpha, sizeof(float)));
+    CUDA_CHECK(cudaMemcpyToSymbol(d_J, &J, sizeof(int)));
+    CUDA_CHECK(cudaMemcpyToSymbol(d_C0, &C0, sizeof(float)));
+    CUDA_CHECK(cudaMemcpyToSymbol(d_d, &d, sizeof(int)));
+
     // 2. Determine max buffer sizes
     max_masks = 1 << d;
-    max_total_configs = (max_J + 1) * max_masks;
+    max_total_configs = (J + 1) * max_masks;
+    k_ranges_size = (J + 1) * d * 2;
     
     // Correctly calculate the maximum possible number of coefficients
     max_total_coeffs = 0;
-    for (int j = 0; j <= max_J; j++) {
+    for (int j = 0; j <= J; j++) {
         int count_per_mask = 1;
         int current_translations = 1 << j;
         for (int i = 0; i < d; i++) {
@@ -433,38 +484,35 @@ DLLEXPORT int generate_wavelet_batch(
     // 3. Allocate device memory
     CUDA_CHECK(cudaMalloc(&d_X_concat, total_points * d * sizeof(float)));
     CUDA_CHECK(cudaMalloc(&d_Y_concat, total_points * sizeof(float)));
-    CUDA_CHECK(cudaMalloc(&d_params, batch_size * sizeof(WaveletParams)));
     CUDA_CHECK(cudaMalloc(&d_all_coeffs, batch_size * max_total_coeffs * sizeof(float)));
     CUDA_CHECK(cudaMalloc(&d_all_coeff_offsets, batch_size * max_total_configs * sizeof(int)));
-    CUDA_CHECK(cudaMalloc(&d_all_k_ranges, batch_size * (max_J + 1) * d * 2 * sizeof(int)));
+    CUDA_CHECK(cudaMalloc(&d_all_k_ranges, batch_size * k_ranges_size * sizeof(int)));
     CUDA_CHECK(cudaMalloc(&d_total_coeffs_per_func, batch_size * sizeof(int)));
     CUDA_CHECK(cudaMalloc(&d_N_values, batch_size * sizeof(int)));
     CUDA_CHECK(cudaMalloc(&d_offsets, batch_size * sizeof(int)));
 
     // 4. Copy inputs from host to device
     CUDA_CHECK(cudaMemcpy(d_X_concat, h_X_concat, total_points * d * sizeof(float), cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(d_params, h_params, batch_size * sizeof(WaveletParams), cudaMemcpyHostToDevice));
     CUDA_CHECK(cudaMemcpy(d_N_values, h_N_values, batch_size * sizeof(int), cudaMemcpyHostToDevice));
     CUDA_CHECK(cudaMemcpy(d_offsets, h_offsets, batch_size * sizeof(int), cudaMemcpyHostToDevice));
 
-    // 5. Compute metadata (offsets and counts)
-    compute_metadata_and_scale_kernel<<<batch_size, THREADS_PER_BLOCK>>>(
-        d_params, batch_size, max_total_coeffs, max_total_configs,
-        d_all_coeffs, d_all_coeff_offsets, d_all_k_ranges, d_total_coeffs_per_func,
-        max_J, true, false // compute metadata, do not scale
+    // 5. Compute metadata once and broadcast
+    compute_shared_metadata_kernel<<<1, THREADS_PER_BLOCK>>>(
+        max_total_configs, d_all_coeff_offsets, d_all_k_ranges, d_total_coeffs_per_func
     );
     CUDA_CHECK(cudaPeekAtLastError());
+
+    if (batch_size > 1) {
+        broadcast_metadata_kernel<<<batch_size - 1, THREADS_PER_BLOCK>>>(
+            batch_size, max_total_configs, k_ranges_size,
+            d_all_coeff_offsets, d_all_k_ranges, d_total_coeffs_per_func
+        );
+        CUDA_CHECK(cudaPeekAtLastError());
+    }
     CUDA_CHECK(cudaDeviceSynchronize());
     
-    // 6. Copy total_coeffs back to host to know how many randoms to generate
-    h_total_coeffs_per_func = (int*)malloc(batch_size * sizeof(int));
-    if (h_total_coeffs_per_func == NULL) {
-        fprintf(stderr, "Failed to allocate host memory for total_coeffs_per_func.\n");
-        status = -1;
-        goto cleanup;
-    }
-    CUDA_CHECK(cudaMemcpy(h_total_coeffs_per_func, d_total_coeffs_per_func, batch_size * sizeof(int), 
-               cudaMemcpyDeviceToHost));
+    // 6. Copy the single total_coeffs value back to host
+    CUDA_CHECK(cudaMemcpy(&h_total_coeffs, d_total_coeffs_per_func, sizeof(int), cudaMemcpyDeviceToHost));
 
     // 7. Generate random numbers
     gens = (curandGenerator_t*)malloc(batch_size * sizeof(curandGenerator_t));
@@ -476,21 +524,20 @@ DLLEXPORT int generate_wavelet_batch(
     for (int i = 0; i < batch_size; i++) gens[i] = NULL;
 
     for (int func_idx = 0; func_idx < batch_size; func_idx++) {
-        int total = h_total_coeffs_per_func[func_idx];
-        if (total > max_total_coeffs) {
-            fprintf(stderr, "Computed coefficient count %d exceeds buffer capacity %d\n", total, max_total_coeffs);
+        if (h_total_coeffs > max_total_coeffs) {
+            fprintf(stderr, "Computed coefficient count %d exceeds buffer capacity %d\n", h_total_coeffs, max_total_coeffs);
             status = -1;
             goto cleanup;
         }
         float* d_func_coeffs = d_all_coeffs + func_idx * max_total_coeffs;
-        int aligned_total = (total % 2 == 0) ? total : total + 1; // curandGenerateUniform prefers even count
+        int aligned_total = (h_total_coeffs % 2 == 0) ? h_total_coeffs : h_total_coeffs + 1;
         if (aligned_total > max_total_coeffs) aligned_total = max_total_coeffs;
         
         CURAND_CHECK(curandCreateGenerator(&gens[func_idx], CURAND_RNG_PSEUDO_DEFAULT));
         gens_created++;
         int stream_idx = func_idx % g_num_streams;
         CURAND_CHECK(curandSetStream(gens[func_idx], g_streams[stream_idx]));
-        CURAND_CHECK(curandSetPseudoRandomGeneratorSeed(gens[func_idx], h_params[func_idx].seed));
+        CURAND_CHECK(curandSetPseudoRandomGeneratorSeed(gens[func_idx], base_seed + func_idx));
         CURAND_CHECK(curandGenerateUniform(gens[func_idx], d_func_coeffs, aligned_total));
     }
 
@@ -499,21 +546,24 @@ DLLEXPORT int generate_wavelet_batch(
     }
     
     // 8. Scale the coefficients
-    compute_metadata_and_scale_kernel<<<batch_size, THREADS_PER_BLOCK>>>(
-        d_params, batch_size, max_total_coeffs, max_total_configs,
-        d_all_coeffs, d_all_coeff_offsets, d_all_k_ranges, d_total_coeffs_per_func,
-        max_J, false, true // do not compute metadata, scale coeffs
+    scale_coefficients_kernel<<<batch_size, THREADS_PER_BLOCK>>>(
+        batch_size, max_total_coeffs, max_total_configs,
+        d_all_coeffs, d_all_coeff_offsets, d_all_k_ranges, d_total_coeffs_per_func
     );
     CUDA_CHECK(cudaPeekAtLastError());
 
     // 9. Evaluate all functions in the batch
-    grid_dim = dim3(batch_size, (max_N + THREADS_PER_BLOCK - 1) / THREADS_PER_BLOCK);
-    evaluate_wavelet_batch_kernel<<<grid_dim, THREADS_PER_BLOCK>>>(
-        d_X_concat, d_params, d_all_coeffs, d_all_coeff_offsets, d_all_k_ranges,
-        max_total_coeffs, max_total_configs, d_Y_concat, d_N_values, d_offsets,
-        max_J
-    );
-    CUDA_CHECK(cudaPeekAtLastError());
+    {
+        int blocks_y = (max_N + THREADS_PER_BLOCK - 1) / THREADS_PER_BLOCK;
+        if (blocks_y > 0) {
+            grid_dim = dim3(batch_size, blocks_y);
+            evaluate_wavelet_batch_kernel<<<grid_dim, THREADS_PER_BLOCK>>>(
+                d_X_concat, d_all_coeffs, d_all_coeff_offsets, d_all_k_ranges,
+                max_total_coeffs, max_total_configs, d_Y_concat, d_N_values, d_offsets
+            );
+            CUDA_CHECK(cudaPeekAtLastError());
+        }
+    }
 
     // 10. Copy results back to host
     CUDA_CHECK(cudaMemcpy(h_Y_concat, d_Y_concat, total_points * sizeof(float), cudaMemcpyDeviceToHost));
@@ -527,9 +577,7 @@ cleanup:
         }
         free(gens);
     }
-    if (h_total_coeffs_per_func != NULL) {
-        free(h_total_coeffs_per_func);
-    }
+    // No need to free h_total_coeffs_per_func, it's a single int on the stack
     // Free device memory best-effort; record first error if not already set
     auto free_device = [&](void* ptr) {
         if (ptr != NULL) {
@@ -541,7 +589,6 @@ cleanup:
     };
     free_device(d_X_concat);
     free_device(d_Y_concat);
-    free_device(d_params);
     free_device(d_all_coeffs);
     free_device(d_all_coeff_offsets);
     free_device(d_all_k_ranges);
