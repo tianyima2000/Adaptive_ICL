@@ -393,8 +393,6 @@ DLLEXPORT int generate_wavelet_batch(
     float support_min = 0.0f, support_max = 0.0f;
     int max_masks = 0;
     int max_total_configs = 0;
-    int max_count_per_mask = 1;
-    int translations = 0;
     int max_total_coeffs = 0;
     dim3 grid_dim(1, 1);
 
@@ -419,11 +417,18 @@ DLLEXPORT int generate_wavelet_batch(
     // 2. Determine max buffer sizes
     max_masks = 1 << d;
     max_total_configs = (max_J + 1) * max_masks;
-    translations = 1 << max_J;
-    for (int i = 0; i < d; i++) {
-        max_count_per_mask *= ((translations - 1) + 2 * K_side + 1);
+    
+    // Correctly calculate the maximum possible number of coefficients
+    max_total_coeffs = 0;
+    for (int j = 0; j <= max_J; j++) {
+        int count_per_mask = 1;
+        int current_translations = 1 << j;
+        for (int i = 0; i < d; i++) {
+            count_per_mask *= ((current_translations - 1) + 2 * K_side + 1);
+        }
+        int num_masks_at_level = (j == 0) ? 1 : max_masks - 1;
+        max_total_coeffs += num_masks_at_level * count_per_mask;
     }
-    max_total_coeffs = max_total_configs * max_count_per_mask;
 
     // 3. Allocate device memory
     CUDA_CHECK(cudaMalloc(&d_X_concat, total_points * d * sizeof(float)));

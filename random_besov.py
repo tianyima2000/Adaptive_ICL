@@ -6,9 +6,10 @@ import shutil
 import subprocess
 import platform
 import sys
+import torch
 
 MAX_GRID_SIZE = 4096
-DEFAULT_CUDA_ARCH = os.environ.get("WAVELET_FAST_ARCH", "sm_70")
+
 
 def _library_basename():
     """Returns the platform-specific shared library name."""
@@ -55,53 +56,23 @@ def _find_cuda_home():
             
     return None # Return None if no path was found
 
-def _build_cuda_library(lib_path, cu_path):
-    """Compiles the CUDA kernel into a shared library."""
-    nvcc = shutil.which("nvcc")
-    if nvcc is None:
-        raise RuntimeError("nvcc (NVIDIA CUDA Compiler) not found in PATH. Ensure the CUDA toolkit is installed and its 'bin' directory is in the system's PATH.")
-    
-    os.makedirs(os.path.dirname(os.path.abspath(lib_path)), exist_ok=True)
-    
-    print(f"Compiling CUDA kernel: {os.path.basename(cu_path)} -> {os.path.basename(lib_path)}...")
-    
-    cmd = [nvcc, "-O3", f"-arch={DEFAULT_CUDA_ARCH}", cu_path, "-o", lib_path, "-lcurand"]
-    
-    if platform.system() == "Windows":
-        cmd.append("-shared")
-    else:
-        cmd.extend(["-shared", "-Xcompiler", "-fPIC"])
-        
-    try:
-        # Use capture_output to get more detailed error info if compilation fails
-        subprocess.run(cmd, check=True, capture_output=True, text=True, encoding='utf-8')
-    except subprocess.CalledProcessError as e:
-        print(f"\n--- CUDA COMPILATION FAILED ---")
-        print(f"Command: {' '.join(cmd)}")
-        print(f"\nNVCC STDOUT:\n{e.stdout}")
-        print(f"\nNVCC STDERR:\n{e.stderr}")
-        raise RuntimeError("Failed to compile the CUDA kernel. See the output above for details.")
-
-def _ensure_cuda_library():
-    """Checks timestamp and rebuilds the library if necessary."""
-    lib_dir = os.path.dirname(os.path.abspath(__file__))
+def _get_library_path():
+    """
+    Returns the path to the pre-compiled CUDA library.
+    Assumes the library is in the same directory as this script.
+    """
     lib_name = _library_basename()
+    lib_dir = os.path.dirname(os.path.abspath(__file__))
     lib_path = os.path.join(lib_dir, lib_name)
-    cu_path = os.path.join(lib_dir, "wavelet_fast.cu")
-    
-    if not os.path.exists(cu_path):
-        raise FileNotFoundError(f"Missing CUDA source: {cu_path}. Cannot build the library.")
-        
-    force_rebuild = os.environ.get("WAVELET_FAST_FORCE_REBUILD", "").lower() in ("1", "true", "yes")
-    
-    # Determine if a rebuild is needed
-    needs_build = force_rebuild or not os.path.exists(lib_path) or \
-                  (os.path.getmtime(cu_path) > os.path.getmtime(lib_path))
-            
-    if needs_build:
-        _build_cuda_library(lib_path, cu_path)
-        
+
+    if not os.path.exists(lib_path):
+        raise FileNotFoundError(
+            f"Shared library not found at: {lib_path}\n"
+            f"If you are compiling manually, make sure the compiled library '{lib_name}' "
+            "is placed in the same directory as this Python script."
+        )
     return lib_path
+
 
 # Define the ctypes Structure to match the C-side struct
 class WaveletParams(ctypes.Structure):
@@ -131,12 +102,45 @@ class FastWaveletBatchGenerator:
             raise ValueError(f"Wavelet grid has {self.grid.size} points, but the CUDA kernel "
                              f"was built with MAX_GRID_SIZE={MAX_GRID_SIZE}.")
         
-        # 2. Ensure the CUDA library is compiled and up-to-date
-        lib_path = _ensure_cuda_library()
+        # 2. Get the path to the pre-compiled CUDA library
+        lib_path = _get_library_path()
         
-        # 3. Add CUDA's bin directory to the DLL search path on Windows
-        # This is critical for finding dependencies like curand64_xx.dll
-        if platform.system() == "Windows" and hasattr(os, 'add_dll_directory'):
+        # 3. Pre-load CUDA dependencies to ensure symbols are available for our library.
+        #    This is platform-specific.
+        if platform.system() == "Linux":
+            # On Linux, we need to manually load shared libraries that our .so file depends on,
+            # especially if the CUDA lib path is not in the system's default search paths or LD_LIBRARY_PATH.
+            loaded_deps = False
+            try:
+                # First, try loading libraries by name, assuming LD_LIBRARY_PATH is set.
+                ctypes.CDLL("libcurand.so", mode=ctypes.RTLD_GLOBAL)
+                ctypes.CDLL("libcudart.so", mode=ctypes.RTLD_GLOBAL)
+                loaded_deps = True
+            except OSError:
+                # If that fails, try to find the CUDA installation and load from its lib directory.
+                cuda_home = _find_cuda_home()
+                if cuda_home:
+                    lib_dir = os.path.join(cuda_home, 'lib64')
+                    if not os.path.isdir(lib_dir):
+                        lib_dir = os.path.join(cuda_home, 'lib')  # Fallback
+                    
+                    try:
+                        ctypes.CDLL(os.path.join(lib_dir, "libcurand.so"), mode=ctypes.RTLD_GLOBAL)
+                        ctypes.CDLL(os.path.join(lib_dir, "libcudart.so"), mode=ctypes.RTLD_GLOBAL)
+                        loaded_deps = True
+                    except OSError:
+                        pass  # Failure will be handled by the final check.
+
+            if not loaded_deps:
+                print(
+                    "Warning: Could not pre-load CUDA libraries 'libcurand.so' or 'libcudart.so'.\n"
+                    "The script will still attempt to load 'wavelet_fast.so', but it may fail with an 'undefined symbol' error.\n"
+                    "To fix this, please ensure your CUDA library path (e.g., /usr/local/cuda/lib64) is in the LD_LIBRARY_PATH environment variable."
+                )
+        
+        elif platform.system() == "Windows" and hasattr(os, 'add_dll_directory'):
+            # On Windows, we add the CUDA bin directory to the DLL search path.
+            # This is critical for finding dependencies like curand64_xx.dll.
             cuda_home = _find_cuda_home()
             if cuda_home:
                 cuda_bin_path = os.path.join(cuda_home, "bin")
@@ -281,3 +285,102 @@ class FastWaveletBatchGenerator:
         # Split the concatenated output back into a list of arrays
         # Note: np.split works correctly even if offsets[1:] is empty (for batch_size=1)
         return np.split(Y_concat, offsets[1:])
+
+    def generate_batch_torch(self, X_list, params_list, device='cuda'):
+        """
+        Generates a batch of random functions directly on a target device.
+
+        Args:
+            X_list (list of np.ndarray): List of input point arrays.
+            params_list (list of dicts): List of function parameters.
+            device (str or torch.device): The Torch device for the output ('cuda', 'cpu', etc.).
+
+        Returns:
+            list of torch.Tensor: A list of 1D tensors, each containing a generated
+                                  function. The tensors reside on the specified device.
+        """
+        if not self.lib:
+            raise RuntimeError("The CUDA library has been unloaded. Please create a new generator instance.")
+        if not params_list:
+            return []
+        if len(X_list) != len(params_list):
+            raise ValueError(f"Length of X_list ({len(X_list)}) must match length of params_list ({len(params_list)}).")
+
+        # Validate all params have the same 'd'
+        d = params_list[0]['d']
+        if any(p['d'] != d for p in params_list):
+            raise ValueError("All functions in a batch must have the same dimension 'd'.")
+        if d < 1 or d > 4:
+            raise ValueError(f"d must be between 1 and 4 (MAX_DIM in CUDA), got {d}")
+
+        # Prepare data for concatenated input (still on CPU)
+        processed_X_list = []
+        for i, X in enumerate(X_list):
+            X_arr = np.ascontiguousarray(np.asarray(X, dtype=np.float32))
+            if X_arr.ndim == 1: X_arr = X_arr.reshape(-1, d)
+            if X_arr.shape[1] != d:
+                raise ValueError(f"X at index {i} must have shape (N, {d}), got {X_arr.shape}")
+            processed_X_list.append(X_arr)
+
+        batch_size = len(params_list)
+        N_values = np.array([x.shape[0] for x in processed_X_list], dtype=np.int32)
+        total_points = np.sum(N_values)
+        max_N = np.max(N_values) if N_values.size > 0 else 0
+        
+        offsets = np.concatenate(([0], np.cumsum(N_values[:-1]))).astype(np.int32)
+
+        X_concat = np.vstack(processed_X_list)
+        
+        max_J = max(p['J'] for p in params_list)
+        
+        # Create ctypes array of a custom struct for parameters
+        ParamsArray = WaveletParams * batch_size
+        h_params = ParamsArray()
+        for i, p in enumerate(params_list):
+            h_params[i] = WaveletParams(
+                alpha=p.get('alpha', 1.0), J=p['J'], C0=p.get('C0', 1.0),
+                seed=p['seed'], d=p['d']
+            )
+            
+        # Prepare output tensor directly on the target device
+        # Using .empty() is efficient as the CUDA kernel will overwrite the memory.
+        Y_torch = torch.empty(total_points, dtype=torch.float32, device=device)
+        
+        # Get data pointer. For CUDA tensors, this is a GPU memory address.
+        # The CUDA kernel must be able to handle receiving a device pointer for the output.
+        Y_ptr = ctypes.cast(Y_torch.data_ptr(), ctypes.POINTER(ctypes.c_float))
+        
+        # Call the CUDA function
+        ret_code = self.lib.generate_wavelet_batch(
+            X_concat.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+            Y_ptr,
+            N_values.ctypes.data_as(ctypes.POINTER(ctypes.c_int)),
+            offsets.ctypes.data_as(ctypes.POINTER(ctypes.c_int)),
+            total_points,
+            d,
+            h_params,
+            batch_size,
+            self.phi.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+            self.psi.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+            self.grid.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+            len(self.grid),
+            max_J,
+            max_N
+        )
+
+        # Check the return code from the C++ function
+        if ret_code != 0:
+            raise RuntimeError(
+                f"The CUDA function 'generate_wavelet_batch' failed with error code {ret_code}. "
+                "This is likely due to a CUDA error, such as running out of GPU memory. "
+                "Check the console output of your Jupyter notebook server for a more detailed 'CUDA Error' message."
+            )
+        
+        # Split the concatenated output tensor back into a list of tensors.
+        # N_values contains the size of each chunk.
+        if total_points > 0:
+            return list(torch.split(Y_torch, N_values.tolist()))
+        else:
+            return []
+
+
