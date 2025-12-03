@@ -16,48 +16,82 @@ from random_besov import FastWaveletBatchGenerator
 # For windows, run "nvcc -O3 wavelet_fast.cu -o wavelet_fast.dll -lcurand -shared"
 
 
-###### Generate pretraining data for in-context regression transformer model
+###### Sampling Utilities
+def sample_unit_ball(n, d):
+    z = np.random.normal(size=(n, d))
+    z /= np.linalg.norm(z, axis=1, keepdims=True)
+    r = np.random.uniform(size=(n, 1)) ** (1 / d)
+    return r * z
 
-def generate_pretrain_data(X_list, params, d_embd, sigma):
+
+def sample_stiefel(d, p):
+    if p > d:
+        raise ValueError("p must be <= d")
+
+    Z = np.random.normal(size=(d, p))
+    Q, R = np.linalg.qr(Z)
+
+    signs = np.sign(np.diag(R))
+    signs[signs == 0] = 1
+    Q *= signs
+    return Q
+
+
+def random_project(X, p):
+    d = X.shape[1]
+    U = sample_stiefel(d, p)
+    X_projected = (np.matmul(X, U) + 1) / 2
+    return X_projected
+
+
+
+###### Generate pretraining data for in-context regression transformer model
+def generate_pretrain_data(batch_size, n, d, p, alpha, J, cascade_level, d_embd, sigma, C0=1.0):
     """
     Generates function data and prepares it for an in-context regression transformer model.
 
     Args:
-        X_list (list of np.ndarray): List of input point arrays. Each array
-            can have N points and dimension d.
-        params (dict): A dictionary that contains the
-            parameters for the functions: {'d', 'alpha', 'J', 'C0'}.
+        batch_size (int): number of functions in the batch.
+        n (int): number of data points per function.
+        d (int): input dimension.
+        p (int): projection dimension.
+        alpha (float): smoothness parameter.
+        J (int): maximum wavelet scale.
+        cascade_level (int): cascade level for wavelet generation.
         d_embd (int): The embedding dimension for the transformer input.
         sigma (float): The standard deviation of Gaussian noise to add to the Y values.
+        C0 (float): scaling constant for the wavelet function.
 
     Returns:
         tuple[torch.Tensor, torch.Tensor]:
         - A tensor of shape (batch_size, N, d_embd) containing the
-          concatenated and padded X and Y sequences. The last Y value
+          concatenated and padded X and Y prompts. The last Y value
           in each sequence is masked with 0.
         - A tensor of shape (batch_size,) containing the true last Y value
           for each sequence, which serves as the regression target.
     """
-    generator = FastWaveletBatchGenerator(wavelet='db6', cascade_level=8)
-    Y_list = generator.generate_batch(X_list, params)
+    X_list = []
+    X_projected_list = []
+    for _ in range(batch_size):
+        X = sample_unit_ball(n, d)
+        X_list.append(X)
+        X_projected_list.append(random_project(X, p))
+
+
+    params = {'d': p, 'alpha': alpha, 'J': J, 'C0': C0}
+    generator = FastWaveletBatchGenerator(wavelet='db6', cascade_level=cascade_level)
+    Y_list = generator.generate_batch(X_projected_list, params)
     generator.cleanup()
 
     device = torch.device('cuda')
-
-    # Ensure d is correctly inferred even for 1D inputs
-    if X_list[0].ndim == 1:
-        d = 1
-    else:
-        d = X_list[0].shape[1]
 
     if (d + 3) > d_embd:
         raise ValueError(f"d_embd ({d_embd}) must be greater than or equal to the input dimension + 3 ({d + 3}).")
 
     batch_size = len(X_list)
-    N = X_list[0].shape[0] 
 
     # Initialize output tensors
-    output_sequences = torch.zeros((batch_size, N, d_embd), dtype=torch.float32, device=device)
+    prompts = torch.zeros((batch_size, n, d_embd), dtype=torch.float32, device=device)
     target_values = torch.zeros(batch_size, dtype=torch.float32, device=device)
 
     for i in range(batch_size):
@@ -66,8 +100,7 @@ def generate_pretrain_data(X_list, params, d_embd, sigma):
         Y_i = Y_list[i]
         
         # Add noise
-        if sigma > 0:
-            Y_i += np.random.normal(scale=sigma, size=Y_i.shape)
+        Y_i += np.random.normal(scale=sigma, size=Y_i.shape)
 
         # Get the target value (the last Y value)
         target_values[i] = torch.as_tensor(Y_i[-1], device=device)
@@ -83,14 +116,14 @@ def generate_pretrain_data(X_list, params, d_embd, sigma):
         Y_i_torch = torch.from_numpy(np.asarray(Y_i, dtype=np.float32)).to(device)
 
         # Concatenate X and Y_masked
-        # Y_masked needs to be shaped as (N, 1)
+        # Y_masked needs to be shaped as (n, 1)
         xy_concat = torch.cat((X_i_torch, Y_i_torch.unsqueeze(-1)), dim=1)
         
         # Place the concatenated sequence into the padded output tensor
-        output_sequences[i, :N, :(d + 1)] = xy_concat
-        output_sequences[i, N - 1, d + 1] = 1
+        prompts[i, :n, :(d + 1)] = xy_concat
+        prompts[i, n - 1, d + 1] = 1
 
-    return output_sequences, target_values
+    return prompts, target_values
 
 
 
@@ -162,8 +195,6 @@ class Block(nn.Module):
         return x
 
 class RegressionTransformer(nn.Module):
-    """ A transformer encoder for regression tasks on sequences of vectors. """
-
     def __init__(self, config):
         super().__init__()
         self.config = config
@@ -171,20 +202,23 @@ class RegressionTransformer(nn.Module):
         self.transformer = nn.ModuleDict(dict(
             h = nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
         ))
+        self.reg_head = nn.Linear(config.d_embd, 1)
 
     def forward(self, x):
-        """
-        x: A float tensor of shape (batch_size, sequence_length, d_embd)
-        """
-        assert x.dim() == 3 and x.size(2) == self.config.d_embd, "Input tensor shape must be (batch, seq_len, d_embd)"
+        assert x.dim() == 3 and x.size(2) == self.config.d_embd
         b, t, c = x.size()
-        assert t <= self.config.max_length, f"Cannot forward sequence of length {t}, max_length is only {self.config.max_length}"
-        
-        # Forward through the transformer blocks
+        assert t <= self.config.max_length
+
         for block in self.transformer.h:
             x = block(x)
-        
-        # Return the last coordinate of the last token
-        return x[:, -1, -1]
+
+        # use last token embedding for regression
+        last_token = x[:, -1, :]           # (B, d_embd)
+        y = self.reg_head(last_token)      # (B, 1)
+        return y
+    
+
+
+
 
 
