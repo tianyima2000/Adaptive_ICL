@@ -253,20 +253,20 @@ set_seed(2025)
 loss_1, loss_2, loss_3, loss_4 = [], [], [], []
 model.eval()
 with torch.no_grad():
-    for i in range(100):
-        prompts, targets = generate_test_data(batch_size = 100, n=n, d=d, p=1, alpha=4, J=10, cascade_level=8, d_max=d, sigma=sigma, device=device, C0=C0)
+    for i in range(10):
+        prompts, targets = generate_test_data(batch_size = 10000, n=n, d=d, p=1, alpha=4, J=10, cascade_level=8, d_max=d, sigma=sigma, device=device, C0=C0)
         outputs = model(prompts)
         loss_1.append((outputs.cpu().detach().numpy().reshape(-1) - targets.cpu().detach().numpy()) ** 2)
 
-        prompts, targets = generate_test_data(batch_size = 100, n=n, d=d, p=1, alpha=3, J=10, cascade_level=8, d_max=d, sigma=sigma, device=device, C0=C0)
+        prompts, targets = generate_test_data(batch_size = 10000, n=n, d=d, p=1, alpha=3, J=10, cascade_level=8, d_max=d, sigma=sigma, device=device, C0=C0)
         outputs = model(prompts)
         loss_2.append((outputs.cpu().detach().numpy().reshape(-1) - targets.cpu().detach().numpy()) ** 2)
 
-        prompts, targets = generate_test_data(batch_size = 100, n=n, d=d, p=1, alpha=2.5, J=10, cascade_level=8, d_max=d, sigma=sigma, device=device, C0=C0)
+        prompts, targets = generate_test_data(batch_size = 10000, n=n, d=d, p=1, alpha=2.5, J=10, cascade_level=8, d_max=d, sigma=sigma, device=device, C0=C0)
         outputs = model(prompts)
         loss_3.append((outputs.cpu().detach().numpy().reshape(-1) - targets.cpu().detach().numpy()) ** 2)
 
-        prompts, targets = generate_test_data(batch_size = 100, n=n, d=d, p=1, alpha=2, J=10, cascade_level=8, d_max=d, sigma=sigma, device=device, C0=C0)
+        prompts, targets = generate_test_data(batch_size = 10000, n=n, d=d, p=1, alpha=2, J=10, cascade_level=8, d_max=d, sigma=sigma, device=device, C0=C0)
         outputs = model(prompts)
         loss_4.append((outputs.cpu().detach().numpy().reshape(-1) - targets.cpu().detach().numpy()) ** 2)
 
