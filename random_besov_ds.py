@@ -201,8 +201,7 @@ class FastWaveletBatchGenerator_ds:
                 same dimension (d) as specified in params. E.g., [X1, X2] 
                 where X1.shape=(N1, d) and X2.shape=(N2, d).
             params (dict): A dictionary containing the shared parameters for the
-                entire batch: {'d', 'alpha', 'J', 'C0'}. The 'seed' parameter
-                is no longer used and is ignored.
+                entire batch: {'d', 'alpha', 'J', 'C0'}. 
         """
         if not self.lib:
             raise RuntimeError("The CUDA library has been unloaded. Please create a new generator instance.")
@@ -271,4 +270,5 @@ class FastWaveletBatchGenerator_ds:
         if total_points > 0:
             return np.split(Y_concat, offsets[1:])
         else:
+
             return []
